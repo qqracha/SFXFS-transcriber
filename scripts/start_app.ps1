@@ -76,7 +76,7 @@ try {
     $frontendReady = $false
     try {
         $response = Invoke-WebRequest -Uri 'http://127.0.0.1:4173/' -UseBasicParsing -TimeoutSec 2
-        $frontendReady = $response.StatusCode -eq 200
+        $frontendReady = $response.StatusCode -eq 200 -and $response.Content -match 'SFXFS Transcriber'
     } catch {}
     if (-not $frontendReady) {
         $frontendProcess = Start-Process -FilePath 'npm.cmd' -ArgumentList @('run','start','--','--port','4173') -WorkingDirectory $appRoot -WindowStyle Hidden -RedirectStandardOutput $frontendOut -RedirectStandardError $frontendErr -PassThru
@@ -88,7 +88,10 @@ try {
         $backendReady = $false
         $frontendReady = $false
         try { $backendReady = [bool](Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/health' -TimeoutSec 2).ok } catch {}
-        try { $frontendReady = (Invoke-WebRequest -Uri 'http://127.0.0.1:4173/' -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200 } catch {}
+        try {
+            $frontendResponse = Invoke-WebRequest -Uri 'http://127.0.0.1:4173/' -UseBasicParsing -TimeoutSec 2
+            $frontendReady = $frontendResponse.StatusCode -eq 200 -and $frontendResponse.Content -match 'SFXFS Transcriber'
+        } catch {}
         if ($backendReady -and $frontendReady) { break }
         Write-Host '.' -NoNewline
         Start-Sleep -Milliseconds 500
