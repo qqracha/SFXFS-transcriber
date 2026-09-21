@@ -44,6 +44,9 @@ type Job = {
   chunk_seconds: number;
   overlap_seconds: number;
   chunks: Array<{ chunk_number: number; chunk_start_time: string; chunk_end_time: string }>;
+  chunks_total: number;
+  chunks_ready: number;
+  chunk_manifest: Array<{ chunk_number: number; chunk_start_time: string; chunk_end_time: string; status: 'pending' | 'ready' }>;
   ai_mode: 'manual' | 'api';
   ai_model: string;
   pipeline_status: string;
@@ -384,6 +387,23 @@ export default function Home() {
                   <div><b>чанки LOGGER</b><strong>{job?.chunks?.length || 0}</strong></div>
                 </div>
               </section>
+
+              {!!job?.chunks_total && (
+                <section className="chunk-live-panel">
+                  <div>
+                    <p className="eyebrow">Live chunks</p>
+                    <strong>Готово {job.chunks_ready} из {job.chunks_total}</strong>
+                    <p>Каждый JSON появляется сразу после завершения своего окна. Можно отправлять его в LOGGER, пока стрим ещё распознаётся.</p>
+                  </div>
+                  <div className="chunk-links">
+                    {(job.chunk_manifest || []).map((chunk) => chunk.status === 'ready' ? (
+                      <a key={chunk.chunk_number} className="download-button" href={`${API}/api/jobs/${job.id}/download/chunk/${chunk.chunk_number}`}>
+                        <Download /> ЧАНК {String(chunk.chunk_number).padStart(2, '0')} · {chunk.chunk_start_time}
+                      </a>
+                    ) : <span key={chunk.chunk_number} className="chunk-pending">ЧАНК {String(chunk.chunk_number).padStart(2, '0')} · {chunk.chunk_start_time} · ожидание</span>)}
+                  </div>
+                </section>
+              )}
 
               {!complete && running && (
                 <div className="working-field" aria-live="polite">

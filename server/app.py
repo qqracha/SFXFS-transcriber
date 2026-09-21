@@ -218,6 +218,10 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "chunk_seconds",
         "overlap_seconds",
         "chunks",
+        "chunk_manifest",
+        "chunks_total",
+        "chunks_ready",
+        "chunk_files",
         "ai_mode",
         "ai_model",
         "pipeline_status",
@@ -363,6 +367,21 @@ def write_pipeline_files(job: dict[str, Any], chunks: list[dict[str, Any]]) -> d
     )
     paths["manual_readme"] = str(readme)
     return paths
+
+
+def write_incremental_chunk(job: dict[str, Any], window: dict[str, Any], segments: list[dict[str, Any]]) -> Path:
+    """Persist one completed LOGGER window while transcription is still running."""
+    output_dir = RESULT_DIR / job["id"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    selected = [
+        segment for segment in segments
+        if float(segment["end"]) > float(window["chunk_start"])
+        and float(segment["start"]) < float(window["chunk_end"])
+    ]
+    payload = {**window, "transcript": selected, "ready_at_seconds": float(window["chunk_end"])}
+    path = output_dir / f"chunk_{int(window['chunk_number']):03d}_logger_input.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
 
 
 def resolve_model_source() -> str:
@@ -653,6 +672,25 @@ def transcribe_job(job_id: str) -> None:
             progress=5.0,
             message=f"Медиа: {format_hhmmss(metadata['duration'])} · FPS {metadata['fps_label']}",
         )
+        chunk_windows = chunk_transcript([], float(metadata["duration"] or 0))
+        chunk_manifest = [
+            {
+                "chunk_number": window["chunk_number"],
+                "chunk_start": window["chunk_start"],
+                "chunk_end": window["chunk_end"],
+                "chunk_start_time": window["chunk_start_time"],
+                "chunk_end_time": window["chunk_end_time"],
+                "status": "pending",
+            }
+            for window in chunk_windows
+        ]
+        update_job(
+            job_id,
+            chunks_total=len(chunk_windows),
+            chunks_ready=0,
+            chunk_manifest=chunk_manifest,
+            chunk_files={},
+        )
         model = load_model(job_id)
         with jobs_lock:
             if jobs[job_id].get("cancel_requested"):
@@ -704,8 +742,28 @@ def transcribe_job(job_id: str) -> None:
             }
             output_segments.append(item)
             text_parts.append(segment_text)
-            elapsed = time.monotonic() - started
+            with jobs_lock:
+                current_job = dict(jobs[job_id])
+            chunk_files = dict(current_job.get("chunk_files") or {})
+            ready_numbers = {int(key.removeprefix("chunk_")) for key in chunk_files}
             processed = float(segment.end)
+            for window in chunk_windows:
+                number = int(window["chunk_number"])
+                if number in ready_numbers or float(window["chunk_end"]) > processed:
+                    continue
+                path = write_incremental_chunk(current_job, window, output_segments)
+                chunk_files[f"chunk_{number:03d}"] = str(path)
+                ready_numbers.add(number)
+                chunk_manifest[number - 1]["status"] = "ready"
+            if len(chunk_files) != int(current_job.get("chunks_ready") or 0):
+                update_job(
+                    job_id,
+                    chunks_ready=len(chunk_files),
+                    chunk_files=chunk_files,
+                    chunk_manifest=chunk_manifest.copy(),
+                    message=f"Распознано фрагментов: {len(output_segments)} · готово чанков: {len(chunk_files)}/{len(chunk_windows)}",
+                )
+            elapsed = time.monotonic() - started
             fraction = min(1.0, processed / duration) if duration > 0 else 0.0
             eta = (elapsed / fraction - elapsed) if fraction > 0.015 else None
             update_job(
@@ -740,6 +798,20 @@ def transcribe_job(job_id: str) -> None:
             md_path=str(md_path),
             json_path=str(json_path),
             chunks=chunks,
+            chunks_total=len(chunks),
+            chunks_ready=len(chunks),
+            chunk_files={key: value for key, value in pipeline_files.items() if key.startswith("chunk_")},
+            chunk_manifest=[
+                {
+                    "chunk_number": chunk["chunk_number"],
+                    "chunk_start": chunk["chunk_start"],
+                    "chunk_end": chunk["chunk_end"],
+                    "chunk_start_time": chunk["chunk_start_time"],
+                    "chunk_end_time": chunk["chunk_end_time"],
+                    "status": "ready",
+                }
+                for chunk in chunks
+            ],
             pipeline_files=pipeline_files,
             pipeline_status="manual_ready" if snapshot.get("ai_mode", "manual") == "manual" else "queued",
         )
@@ -825,6 +897,10 @@ def create_job(
         "chunk_seconds": CHUNK_SECONDS,
         "overlap_seconds": OVERLAP_SECONDS,
         "chunks": [],
+        "chunk_manifest": [],
+        "chunks_total": 0,
+        "chunks_ready": 0,
+        "chunk_files": {},
         "ai_mode": ai_mode,
         "ai_model": ai_model,
         "pipeline_status": "queued",
@@ -906,6 +982,23 @@ def download_result(job_id: str, kind: str) -> FileResponse:
     elif kind.endswith("json"):
         media_type = "application/json"
     return FileResponse(path, media_type=media_type, filename=path.name)
+
+
+@app.get("/api/jobs/{job_id}/download/chunk/{number}")
+def download_chunk(job_id: str, number: int) -> FileResponse:
+    """Download a LOGGER input as soon as its 25-minute window is complete."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Задача не найдена")
+        path_value = (job.get("chunk_files") or {}).get(f"chunk_{number:03d}")
+    if not path_value:
+        raise HTTPException(status_code=404, detail="Этот чанк ещё не готов")
+    path = Path(path_value).resolve()
+    job_root = (RESULT_DIR / job_id).resolve()
+    if not path.is_file() or not (path == job_root or job_root in path.parents):
+        raise HTTPException(status_code=404, detail="Файл чанка не найден")
+    return FileResponse(path, media_type="application/json", filename=path.name)
 
 
 @app.post("/api/jobs/{job_id}/pipeline/{stage}/result")
