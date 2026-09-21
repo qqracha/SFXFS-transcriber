@@ -32,6 +32,7 @@ ALLOWED_EXTENSIONS = {".mp4", ".mp3", ".wav"}
 MODEL_NAME = "small"
 CHUNK_SECONDS = 25 * 60
 OVERLAP_SECONDS = 5 * 60
+CUTTER_CONTEXT_SECONDS = 90
 PROMPT_VERSION = "2026-09-21"
 
 for directory in (UPLOAD_DIR, RESULT_DIR, MODEL_DIR):
@@ -225,6 +226,12 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "ai_mode",
         "ai_model",
         "pipeline_status",
+        "pipeline_error",
+        "editor_status",
+        "editor_ideas_count",
+        "editor_ideas",
+        "cutter_inputs",
+        "cutter_input_files",
         "pipeline_files",
         "edl_files",
         "csv_files",
@@ -353,9 +360,6 @@ def write_pipeline_files(job: dict[str, Any], chunks: list[dict[str, Any]]) -> d
     editor_input = output_dir / "editor_input.json"
     editor_input.write_text(json.dumps({"stream_id": job["id"], "episodes": []}, ensure_ascii=False, indent=2), encoding="utf-8")
     paths["editor_input_json"] = str(editor_input)
-    cutter_input = output_dir / "cutter_input.json"
-    cutter_input.write_text(json.dumps({"stream_id": job["id"], "video_idea": None, "transcript_context": []}, ensure_ascii=False, indent=2), encoding="utf-8")
-    paths["cutter_input_json"] = str(cutter_input)
     readme = output_dir / "MANUAL_PIPELINE.md"
     readme.write_text(
         "# SFXFS manual pipeline\n\n"
@@ -553,6 +557,100 @@ def normalize_list(value: Any, keys: tuple[str, ...]) -> list[dict[str, Any]]:
     return []
 
 
+def active_stream_id(job_id: str, payload: Any) -> str:
+    """Manual exports may omit stream_id; the current local job is authoritative."""
+    if isinstance(payload, dict) and str(payload.get("stream_id") or "").strip():
+        return str(payload["stream_id"])
+    return job_id
+
+
+def normalise_stream_index(job_id: str, payload: Any) -> dict[str, Any]:
+    if isinstance(payload, list):
+        payload = {"episodes": payload}
+    if not isinstance(payload, dict):
+        raise ValueError("stream_index должен быть JSON-объектом с top-level episodes")
+    episodes = normalize_list(payload, ("episodes", "stream_index", "items"))
+    if not episodes:
+        raise ValueError("stream_index не содержит непустой top-level episodes")
+    result = dict(payload)
+    result["stream_id"] = active_stream_id(job_id, payload)
+    result["episodes"] = episodes
+    return result
+
+
+def build_cutter_inputs(job: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, str], list[str]]:
+    """Join EDITOR source_episodes to the MERGED stream index and real transcript."""
+    pipeline = job.get("pipeline") or {}
+    ideas = pipeline.get("editor_ideas") or []
+    stream_index = pipeline.get("stream_index") or {}
+    index_episodes = normalize_list(stream_index, ("episodes",))
+    episode_by_id = {str(item.get("episode_id")).strip(): item for item in index_episodes if item.get("episode_id") is not None}
+    transcript = job.get("segments") or []
+    errors: list[str] = []
+    inputs: list[dict[str, Any]] = []
+    output_dir = RESULT_DIR / job["id"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for old_path in output_dir.glob("cutter_input_*.json"):
+        old_path.unlink(missing_ok=True)
+
+    for idea_index, idea in enumerate(ideas, start=1):
+        source_ids = idea.get("source_episodes") or []
+        if not isinstance(source_ids, list) or not source_ids:
+            errors.append(f"идея {idea_index:02d}: отсутствует source_episodes")
+            continue
+        related: list[dict[str, Any]] = []
+        contexts: list[dict[str, Any]] = []
+        combined_segments: dict[str, dict[str, Any]] = {}
+        missing_ids: list[str] = []
+        for raw_id in source_ids:
+            episode_id = str(raw_id).strip()
+            episode = episode_by_id.get(episode_id)
+            if episode is None:
+                missing_ids.append(episode_id)
+                continue
+            try:
+                start, end = float(episode["start"]), float(episode["end"])
+            except (KeyError, TypeError, ValueError):
+                errors.append(f"идея {idea_index:02d}, эпизод {episode_id}: нет числовых start/end")
+                continue
+            before_start = max(0.0, start - CUTTER_CONTEXT_SECONDS)
+            after_end = end + CUTTER_CONTEXT_SECONDS
+            before = [segment for segment in transcript if float(segment["end"]) > before_start and float(segment["start"]) < start]
+            main = [segment for segment in transcript if float(segment["end"]) > start and float(segment["start"]) < end]
+            after = [segment for segment in transcript if float(segment["end"]) > end and float(segment["start"]) < after_end]
+            for segment in before + main + after:
+                combined_segments[str(segment.get("id"))] = segment
+            if not main:
+                errors.append(f"идея {idea_index:02d}, эпизод {episode_id}: в транскрипте нет реплик для диапазона {start:.3f}-{end:.3f}")
+            related.append(episode)
+            contexts.append({
+                "episode_id": episode_id,
+                "range": {"start": start, "end": end},
+                "context_before": before,
+                "transcript": main,
+                "context_after": after,
+            })
+        if missing_ids:
+            errors.append(f"идея {idea_index:02d}: source_episodes не найдены в stream_index: {', '.join(missing_ids)}")
+        if len(related) != len(source_ids):
+            continue
+        input_payload = {
+            "stream_id": job["id"],
+            "idea_number": idea_index,
+            "video_idea": idea,
+            "source_episode_ids": [str(item) for item in source_ids],
+            "episodes": related,
+            "transcript": sorted(combined_segments.values(), key=lambda item: float(item["start"])),
+            "transcript_context": contexts,
+            "context_seconds": CUTTER_CONTEXT_SECONDS,
+        }
+        path = output_dir / f"cutter_input_{idea_index:02d}.json"
+        path.write_text(json.dumps(input_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        inputs.append(input_payload)
+    files = {f"cutter_input_{index:02d}": str(output_dir / f"cutter_input_{index:02d}.json") for index in range(1, len(ideas) + 1) if (output_dir / f"cutter_input_{index:02d}.json").is_file()}
+    return inputs, files, errors
+
+
 def merge_logger_results(results: list[Any]) -> list[dict[str, Any]]:
     episodes = []
     for result in results:
@@ -612,9 +710,18 @@ def finalize_pipeline_outputs(job_id: str) -> None:
     pipeline_path = output_dir / "pipeline_results.json"
     pipeline_path.write_text(json.dumps(pipeline, ensure_ascii=False, indent=2), encoding="utf-8")
     editor_input = output_dir / "editor_input.json"
-    editor_input.write_text(json.dumps({"stream_id": job_id, "episodes": pipeline.get("logger_episodes") or []}, ensure_ascii=False, indent=2), encoding="utf-8")
-    cutter_input = output_dir / "cutter_input.json"
-    cutter_input.write_text(json.dumps({"stream_id": job_id, "video_ideas": pipeline.get("editor_ideas") or [], "episodes": pipeline.get("logger_episodes") or []}, ensure_ascii=False, indent=2), encoding="utf-8")
+    editor_episodes = (pipeline.get("stream_index") or {}).get("episodes") or pipeline.get("logger_episodes") or []
+    editor_input.write_text(json.dumps({"stream_id": job_id, "episodes": editor_episodes}, ensure_ascii=False, indent=2), encoding="utf-8")
+    cutter_inputs, cutter_input_files, cutter_errors = build_cutter_inputs(job)
+    pipeline_error = ""
+    if pipeline.get("editor_ideas"):
+        if not pipeline.get("stream_index"):
+            cutter_errors.insert(0, "stream_index.json ещё не импортирован")
+        if cutter_errors:
+            pipeline_error = (
+                f"EDITOR result содержит {len(pipeline['editor_ideas'])} video ideas, "
+                f"но CUTTER INPUT не удалось собрать: " + "; ".join(cutter_errors)
+            )
     edl_files: dict[str, str] = {}
     csv_files: dict[str, str] = {}
     for level in ("logger", "editor", "cutter"):
@@ -633,8 +740,13 @@ def finalize_pipeline_outputs(job_id: str) -> None:
             **(job.get("pipeline_files") or {}),
             "pipeline_results_json": str(pipeline_path),
             "editor_input_json": str(editor_input),
-            "cutter_input_json": str(cutter_input),
+            **cutter_input_files,
         },
+        cutter_inputs=cutter_inputs,
+        cutter_input_files=cutter_input_files,
+        pipeline_error=pipeline_error,
+        editor_ideas_count=len(pipeline.get("editor_ideas") or []),
+        editor_status=(f"EDITOR: {len(pipeline['editor_ideas'])} video ideas loaded" if pipeline.get("editor_ideas") else ""),
     )
 
 
@@ -904,6 +1016,11 @@ def create_job(
         "ai_mode": ai_mode,
         "ai_model": ai_model,
         "pipeline_status": "queued",
+        "pipeline_error": "",
+        "editor_status": "",
+        "editor_ideas_count": 0,
+        "cutter_inputs": [],
+        "cutter_input_files": {},
         "pipeline": {},
         "pipeline_files": {},
         "edl_files": {},
@@ -1001,11 +1118,27 @@ def download_chunk(job_id: str, number: int) -> FileResponse:
     return FileResponse(path, media_type="application/json", filename=path.name)
 
 
+@app.get("/api/jobs/{job_id}/download/cutter-input/{number}")
+def download_cutter_input(job_id: str, number: int) -> FileResponse:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Задача не найдена")
+        path_value = (job.get("cutter_input_files") or {}).get(f"cutter_input_{number:02d}")
+    if not path_value:
+        raise HTTPException(status_code=404, detail="CUTTER INPUT для этой идеи не готов")
+    path = Path(path_value).resolve()
+    job_root = (RESULT_DIR / job_id).resolve()
+    if not path.is_file() or not (path == job_root or job_root in path.parents):
+        raise HTTPException(status_code=404, detail="CUTTER INPUT не найден")
+    return FileResponse(path, media_type="application/json", filename=path.name)
+
+
 @app.post("/api/jobs/{job_id}/pipeline/{stage}/result")
 def save_pipeline_result(job_id: str, stage: str, payload: Any = Body(...)) -> dict[str, Any]:
-    """Manual Mode bridge: paste LOGGER/EDITOR/CUTTER JSON back into the local job."""
-    if stage not in {"logger", "editor", "cutter"}:
-        raise HTTPException(status_code=400, detail="Этап должен быть logger, editor или cutter")
+    """Manual Mode bridge: import LOGGER, stream index, EDITOR and CUTTER JSON."""
+    if stage not in {"logger", "stream_index", "editor", "cutter"}:
+        raise HTTPException(status_code=400, detail="Этап должен быть logger, stream_index, editor или cutter")
     with jobs_lock:
         job = jobs.get(job_id)
         if not job:
@@ -1018,8 +1151,22 @@ def save_pipeline_result(job_id: str, stage: str, payload: Any = Body(...)) -> d
             raise HTTPException(status_code=400, detail=f"Некорректный JSON: {exc}")
     if stage == "logger":
         pipeline["logger_episodes"] = merge_logger_results([payload])
+    elif stage == "stream_index":
+        try:
+            pipeline["stream_index"] = normalise_stream_index(job_id, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     elif stage == "editor":
-        pipeline["editor_ideas"] = normalize_list(payload, ("video_ideas", "ideas", "items"))
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="EDITOR result должен быть JSON-объектом")
+        ideas = normalize_list(payload, ("video_ideas",))
+        if not ideas:
+            raise HTTPException(status_code=400, detail="EDITOR result не содержит непустой top-level video_ideas")
+        editor_output = dict(payload)
+        editor_output["stream_id"] = active_stream_id(job_id, payload)
+        pipeline["editor_output"] = editor_output
+        pipeline["editor_ideas"] = ideas
+        pipeline["stream_id"] = job_id
     else:
         pipeline["cutter_segments"] = normalize_list(payload, ("source_segments", "segments", "items"))
     update_job(job_id, pipeline=pipeline, pipeline_status=f"manual_{stage}_saved", message=f"Manual Mode: результат {stage.upper()} сохранён")

@@ -192,6 +192,16 @@
 .manual-controls { display: grid; grid-template-columns: 180px 1fr auto; gap: 8px; align-items: start; }
 .manual-controls textarea { min-height: 96px; border: 1px solid var(--ink); border-radius: 0; background: var(--paper); padding: 10px; font: 500 11px/1.5 var(--font-geist-mono), monospace; resize: vertical; }
 .manual-submit { height: 40px; border-radius: 0; background: var(--ink); color: var(--paper); font-size: 11px; }
+.manual-imports { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 16px; }
+.import-file-button { display: inline-flex; align-items: center; min-height: 34px; border: 1px solid var(--ink); background: var(--paper); padding: 0 10px; font: 500 10px var(--font-geist-mono), monospace; text-transform: uppercase; cursor: pointer; }
+.import-file-button input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.pipeline-error { grid-column: 1 / -1; margin-top: 14px; }
+.editor-ideas-panel { display: grid; gap: 14px; grid-template-columns: minmax(220px, .45fr) minmax(0, 1fr); grid-template-rows: auto auto; margin-top: 20px; border-top: 1px solid var(--line); padding-top: 18px; }
+.editor-ideas-panel strong { display: block; font-size: 18px; letter-spacing: -.04em; }
+.editor-idea-list { max-height: 190px; overflow: auto; border: 1px solid var(--line); background: var(--paper); padding: 10px 12px; font-size: 12px; line-height: 1.7; }
+.editor-idea-list span { color: var(--red); font: 500 10px var(--font-geist-mono), monospace; }
+.cutter-choice { display: flex; grid-column: 1 / -1; gap: 8px; align-items: center; }
+.cutter-choice .language-select { flex: 1; }
 .new-file-button { display: inline-flex; align-items: center; gap: 8px; margin-top: 18px; border: 0; border-bottom: 1px solid var(--ink); background: none; padding: 0 0 2px; font: 500 10px var(--font-geist-mono), monospace; text-transform: uppercase; }
 .new-file-button svg { width: 13px; }
 
@@ -212,6 +222,8 @@
   .manual-panel { grid-template-columns: 1fr; }
   .manual-controls { grid-template-columns: 1fr; }
   .chunk-live-panel { grid-template-columns: 1fr; }
+  .editor-ideas-panel { grid-template-columns: 1fr; }
+  .cutter-choice { align-items: stretch; flex-direction: column; }
   .result-actions { flex-wrap: wrap; }
   .segment-list { border-top: 1px solid var(--ink); border-left: 0; }
   .site-footer { flex-direction: column; gap: 6px; }

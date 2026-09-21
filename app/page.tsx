@@ -20,6 +20,7 @@ const API = 'http://127.0.0.1:8765';
 const ACCEPTED = ['mp4', 'mp3', 'wav'];
 
 type Segment = { id: number; start: number; end: number; text: string };
+type VideoIdea = Record<string, unknown>;
 type Job = {
   id: string;
   filename: string;
@@ -50,6 +51,11 @@ type Job = {
   ai_mode: 'manual' | 'api';
   ai_model: string;
   pipeline_status: string;
+  pipeline_error: string;
+  editor_status: string;
+  editor_ideas_count: number;
+  editor_ideas: VideoIdea[];
+  cutter_input_files: Record<string, string>;
 };
 
 function bytes(value: number) {
@@ -75,6 +81,13 @@ function stamp(value: number) {
   return hours
     ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
     : `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function ideaTitle(idea: VideoIdea, index: number) {
+  for (const key of ['title_concept', 'title', 'name']) {
+    if (typeof idea[key] === 'string' && idea[key]) return idea[key] as string;
+  }
+  return `Video idea ${String(index + 1).padStart(2, '0')}`;
 }
 
 function stageName(job: Job | null, uploading: boolean) {
@@ -110,9 +123,10 @@ export default function Home() {
   const [online, setOnline] = useState<boolean | null>(null);
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
-  const [manualStage, setManualStage] = useState<'logger' | 'editor' | 'cutter'>('logger');
+  const [manualStage, setManualStage] = useState<'logger' | 'stream_index' | 'editor' | 'cutter'>('logger');
   const [manualJson, setManualJson] = useState('');
   const [manualSending, setManualSending] = useState(false);
+  const [selectedIdea, setSelectedIdea] = useState(1);
 
   const mediaUrl = useMemo(() => (file ? URL.createObjectURL(file) : ''), [file]);
   useEffect(() => () => { if (mediaUrl) URL.revokeObjectURL(mediaUrl); }, [mediaUrl]);
@@ -225,6 +239,30 @@ export default function Home() {
       setManualJson('');
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : 'Не удалось сохранить JSON');
+    } finally {
+      setManualSending(false);
+    }
+  };
+
+  const importPipelineFile = async (stage: 'stream_index' | 'editor', candidate?: File) => {
+    if (!job || !candidate) return;
+    setManualSending(true);
+    setError('');
+    try {
+      const response = await fetch(`${API}/api/jobs/${job.id}/pipeline/${stage}/result`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: await candidate.text(),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as { detail?: string };
+        throw new Error(payload.detail || `Не удалось импортировать ${stage}.json`);
+      }
+      const nextJob = await response.json() as Job;
+      setJob(nextJob);
+      if (stage === 'editor') setSelectedIdea(1);
+    } catch (importError) {
+      setError(importError instanceof Error ? importError.message : 'Не удалось импортировать JSON');
     } finally {
       setManualSending(false);
     }
@@ -384,7 +422,7 @@ export default function Home() {
                   <div><b>прошло</b><strong>{clock(job?.elapsed_seconds)}</strong></div>
                   <div><b>осталось</b><strong>{complete ? '0:00' : clock(job?.eta_seconds)}</strong></div>
                   <div><b>реплики</b><strong>{job?.segments.length || 0}</strong></div>
-                  <div><b>чанки LOGGER</b><strong>{job?.chunks?.length || 0}</strong></div>
+                  <div><b>чанки LOGGER</b><strong>{job?.chunks_ready || job?.chunks?.length || 0}</strong></div>
                 </div>
               </section>
 
@@ -442,7 +480,6 @@ export default function Home() {
                       {(['cutter', 'logger', 'editor'] as const).map((level) => <a key={`${level}-csv`} className="download-button" href={`${API}/api/jobs/${job.id}/download/${level}_csv`}><Download /> {level.toUpperCase()} CSV</a>)}
                       <a className="download-button" href={`${API}/api/jobs/${job.id}/download/stream_json`}><Download /> CHUNKS JSON</a>
                       <a className="download-button" href={`${API}/api/jobs/${job.id}/download/editor_input`}><Download /> EDITOR INPUT</a>
-                      <a className="download-button" href={`${API}/api/jobs/${job.id}/download/cutter_input`}><Download /> CUTTER INPUT</a>
                     </div>
                   </div>
                   {job.ai_mode === 'manual' && (
@@ -450,17 +487,42 @@ export default function Home() {
                       <div>
                         <p className="eyebrow">Manual pipeline</p>
                         <strong>Вернуть ответ нейросети</strong>
-                        <p>Скачай JSON-входы, отправь их в LOGGER / EDITOR / CUTTER и вставь ответ сюда. После CUTTER EDL обновится автоматически.</p>
+                        <p>Импортируй MERGE stream_index и EDITOR output. Приложение свяжет source_episodes с реальными репликами транскрипта.</p>
+                        <div className="manual-imports">
+                          <label className="import-file-button">Импорт stream_index.json<input type="file" accept=".json,application/json" disabled={manualSending} onChange={(event) => importPipelineFile('stream_index', event.target.files?.[0])} /></label>
+                          <label className="import-file-button">Импорт editor_output.json<input type="file" accept=".json,application/json" disabled={manualSending} onChange={(event) => importPipelineFile('editor', event.target.files?.[0])} /></label>
+                        </div>
                       </div>
                       <div className="manual-controls">
-                        <NativeSelect value={manualStage} onChange={(event) => setManualStage(event.target.value as 'logger' | 'editor' | 'cutter')} className="language-select">
+                        <NativeSelect value={manualStage} onChange={(event) => setManualStage(event.target.value as 'logger' | 'stream_index' | 'editor' | 'cutter')} className="language-select">
                           <NativeSelectOption value="logger">LOGGER result</NativeSelectOption>
+                          <NativeSelectOption value="stream_index">stream_index result</NativeSelectOption>
                           <NativeSelectOption value="editor">EDITOR result</NativeSelectOption>
                           <NativeSelectOption value="cutter">CUTTER result</NativeSelectOption>
                         </NativeSelect>
                         <textarea value={manualJson} onChange={(event) => setManualJson(event.target.value)} placeholder='Вставь JSON-ответ, например {"episodes": [...]}' />
                         <Button className="manual-submit" onClick={submitManualResult} disabled={!manualJson.trim() || manualSending}>{manualSending ? 'Сохраняю…' : 'Сохранить JSON'}</Button>
                       </div>
+                      {job.pipeline_error && <p className="error-line pipeline-error">{job.pipeline_error}</p>}
+                      {!!job.editor_ideas_count && (
+                        <div className="editor-ideas-panel">
+                          <div>
+                            <p className="eyebrow">{job.editor_status || `EDITOR: ${job.editor_ideas_count} video ideas loaded`}</p>
+                            <strong>EDITOR: {job.editor_ideas_count} идей</strong>
+                          </div>
+                          <div className="editor-idea-list">
+                            {job.editor_ideas.map((idea, index) => <div key={index}><span>[{String(index + 1).padStart(2, '0')}]</span> {ideaTitle(idea, index)}</div>)}
+                          </div>
+                          <div className="cutter-choice">
+                            <NativeSelect value={String(selectedIdea)} onChange={(event) => setSelectedIdea(Number(event.target.value))} className="language-select">
+                              {job.editor_ideas.map((idea, index) => <NativeSelectOption key={index} value={String(index + 1)}>{String(index + 1).padStart(2, '0')} · {ideaTitle(idea, index)}</NativeSelectOption>)}
+                            </NativeSelect>
+                            {job.cutter_input_files?.[`cutter_input_${String(selectedIdea).padStart(2, '0')}`] ? (
+                              <a className="download-button" href={`${API}/api/jobs/${job.id}/download/cutter-input/${selectedIdea}`}><Download /> Скачать CUTTER INPUT</a>
+                            ) : <span className="chunk-pending">CUTTER INPUT не собран</span>}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                   <div className="result-grid">
