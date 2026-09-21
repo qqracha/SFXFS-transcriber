@@ -27,15 +27,17 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 APP_DIR = Path(os.environ.get("TRANSCRIBER_APP_DIR", Path(__file__).resolve().parents[1])).resolve()
 UPLOAD_DIR = APP_DIR / "work" / "uploads"
 RESULT_DIR = APP_DIR / "results"
+PROJECT_DIR = APP_DIR / "projects"
 MODEL_DIR = Path(os.environ.get("TRANSCRIBER_MODEL_DIR", APP_DIR / "models")).resolve()
 ALLOWED_EXTENSIONS = {".mp4", ".mp3", ".wav"}
+TRANSCRIPT_EXTENSIONS = {".json", ".md", ".txt"}
 MODEL_NAME = "small"
 CHUNK_SECONDS = 25 * 60
 OVERLAP_SECONDS = 5 * 60
 CUTTER_CONTEXT_SECONDS = 90
 PROMPT_VERSION = "2026-09-21"
 
-for directory in (UPLOAD_DIR, RESULT_DIR, MODEL_DIR):
+for directory in (UPLOAD_DIR, RESULT_DIR, PROJECT_DIR, MODEL_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="SFXFS Transcriber", version="1.0.0")
@@ -161,12 +163,20 @@ def chunk_transcript(segments: list[dict[str, Any]], duration: float) -> list[di
     """Build LOGGER windows while preserving original VOD timestamps."""
     if duration <= 0:
         return []
+    timed_segments = []
+    for segment in segments:
+        try:
+            float(segment["start"])
+            float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        timed_segments.append(segment)
     chunks: list[dict[str, Any]] = []
     start = 0.0
     while start < duration:
         end = min(duration, start + CHUNK_SECONDS)
         selected = [
-            segment for segment in segments
+            segment for segment in timed_segments
             if float(segment["end"]) > start and float(segment["start"]) < end
         ]
         chunks.append({
@@ -186,6 +196,118 @@ def chunk_transcript(segments: list[dict[str, Any]], duration: float) -> list[di
     for chunk in chunks:
         chunk["total_chunks"] = total
     return chunks
+
+
+TIMESTAMP_TOKEN = r"(?:\d{1,2}:)?\d{1,2}:\d{2}(?:[\.,]\d{1,3})?"
+
+
+def parse_timecode(value: str) -> float:
+    value = value.strip().replace(",", ".")
+    parts = value.split(":")
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+    elif len(parts) == 2:
+        hours, minutes, seconds = "0", parts[0], parts[1]
+    else:
+        return float(value)
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def parse_transcript_payload(filename: str, raw_bytes: bytes) -> dict[str, Any]:
+    """Normalize JSON/Markdown/TXT into the same segment shape as faster-whisper."""
+    suffix = Path(filename).suffix.lower()
+    text = raw_bytes.decode("utf-8-sig", errors="replace")
+    if suffix == ".json":
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Некорректный JSON: {exc}")
+        source_meta = payload if isinstance(payload, dict) else {}
+        raw_segments = payload if isinstance(payload, list) else (payload.get("segments") or payload.get("transcript") or payload.get("items") or [])
+        if not isinstance(raw_segments, list):
+            raise ValueError("JSON не содержит массива segments")
+        segments: list[dict[str, Any]] = []
+        for index, raw_segment in enumerate(raw_segments, start=1):
+            if not isinstance(raw_segment, dict) or not str(raw_segment.get("text") or "").strip():
+                continue
+            item = dict(raw_segment)
+            start = item.get("start")
+            end = item.get("end")
+            try:
+                start = float(start) if start is not None else parse_timecode(str(item.get("start_time")))
+            except (TypeError, ValueError):
+                start = None
+            try:
+                end = float(end) if end is not None else parse_timecode(str(item.get("end_time")))
+            except (TypeError, ValueError):
+                end = None
+            item["id"] = item.get("id") or index
+            item["start"] = start
+            item["end"] = end
+            item["text"] = re.sub(r"\s+", " ", str(item["text"])).strip()
+            segments.append(item)
+        stream_id = source_meta.get("stream_id") if isinstance(source_meta, dict) else None
+        source_format = "JSON"
+    else:
+        segments = []
+        current_range: tuple[float, float] | None = None
+        timestamp_seen = False
+        lines = text.splitlines()
+        range_pattern = re.compile(rf"^\s*\[?({TIMESTAMP_TOKEN})\]?\s*(?:-->|→|-)\s*\[?({TIMESTAMP_TOKEN})\]?\s*(?:\|\s*|\s+)?(.*)$")
+        start_pattern = re.compile(rf"^\s*\[?({TIMESTAMP_TOKEN})\]?\s*(?:\||\s+)?(.*)$")
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            range_match = range_pattern.match(stripped)
+            if range_match:
+                current_range = (parse_timecode(range_match.group(1)), parse_timecode(range_match.group(2)))
+                timestamp_seen = True
+                inline_text = range_match.group(3).strip(" -–—:|")
+                if inline_text:
+                    segments.append({"id": len(segments) + 1, "start": current_range[0], "end": current_range[1], "text": inline_text})
+                    current_range = None
+                continue
+            start_match = start_pattern.match(stripped)
+            if start_match and ":" in start_match.group(1):
+                start = parse_timecode(start_match.group(1))
+                line_text = start_match.group(2).strip(" -–—:")
+                if current_range:
+                    start, end = current_range
+                    current_range = None
+                else:
+                    end = None
+                if line_text:
+                    segments.append({"id": len(segments) + 1, "start": start, "end": end, "text": line_text})
+                timestamp_seen = True
+                continue
+            if current_range and stripped:
+                segments.append({"id": len(segments) + 1, "start": current_range[0], "end": current_range[1], "text": stripped})
+                current_range = None
+            elif segments and segments[-1].get("start") is not None:
+                segments[-1]["text"] = f"{segments[-1]['text']} {stripped}".strip()
+        stream_id = None
+        source_format = suffix.upper().lstrip(".") or "TEXT"
+        if not timestamp_seen:
+            plain_lines = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+            segments = [{"id": index, "start": None, "end": None, "text": line} for index, line in enumerate(plain_lines, start=1)]
+    timed = [segment for segment in segments if segment.get("start") is not None]
+    timed.sort(key=lambda item: float(item["start"]))
+    for index, segment in enumerate(timed):
+        if segment.get("end") is None:
+            next_start = timed[index + 1].get("start") if index + 1 < len(timed) else float(segment["start"]) + 5.0
+            segment["end"] = max(float(segment["start"]), float(next_start))
+    duration = max((float(segment["end"]) for segment in timed if segment.get("end") is not None), default=0.0)
+    return {
+        "segments": segments,
+        "text": " ".join(str(segment.get("text") or "") for segment in segments).strip(),
+        "duration": duration,
+        "source_format": source_format,
+        "stream_id": str(stream_id or "").strip(),
+        "timestamped": bool(timed),
+        "first_timestamp": min((float(segment["start"]) for segment in timed), default=None),
+        "last_timestamp": max((float(segment["end"]) for segment in timed), default=None),
+    }
 
 
 def update_job(job_id: str, **values: Any) -> None:
@@ -240,8 +362,61 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "error",
         "created_at",
         "updated_at",
+        "imported",
+        "source_format",
+        "timestamped",
+        "timestamp_warning",
+        "first_timestamp",
+        "last_timestamp",
     }
     return {key: value for key, value in job.items() if key in allowed}
+
+
+def persist_project_state(job: dict[str, Any]) -> None:
+    """Keep a restart-safe project snapshot alongside the generated result files."""
+    project_dir = PROJECT_DIR / str(job["id"])
+    project_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = {
+        key: value for key, value in job.items()
+        if key not in {"source_path", "cancel_requested"}
+    }
+    (project_dir / "metadata.json").write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    if job.get("segments"):
+        (project_dir / "transcript.json").write_text(
+            json.dumps({
+                "stream_id": job["id"],
+                "filename": job.get("filename"),
+                "duration": job.get("duration"),
+                "segments": job.get("segments") or [],
+            }, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    result_dir = RESULT_DIR / str(job["id"])
+    if result_dir.is_dir():
+        project_results = project_dir / "results"
+        project_results.mkdir(exist_ok=True)
+        for source in result_dir.iterdir():
+            if source.is_file():
+                try:
+                    shutil.copy2(source, project_results / source.name)
+                except OSError:
+                    pass
+
+
+def restore_projects() -> None:
+    """Load completed projects so a browser/app restart does not lose the workspace."""
+    for metadata_path in PROJECT_DIR.glob("*/metadata.json"):
+        try:
+            snapshot = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(snapshot, dict) or not snapshot.get("id"):
+                continue
+            snapshot.setdefault("source_path", "")
+            snapshot.setdefault("cancel_requested", False)
+            with jobs_lock:
+                jobs[str(snapshot["id"])] = snapshot
+        except (OSError, json.JSONDecodeError):
+            continue
 
 
 def write_csv_markers(path: Path, markers: list[dict[str, Any]], fps: float | None, drop_frame: bool | None = None) -> None:
@@ -436,11 +611,12 @@ def write_results(job: dict[str, Any], segments: list[dict[str, Any]], text: str
         md_path = RESULT_DIR / f"{base}.md"
     txt_path.write_text(text.strip() + "\n", encoding="utf-8-sig")
 
+    imported_note = "Импортированная транскрипция" if job.get("imported") else f"Движок: faster-whisper `{MODEL_NAME}`"
     lines = [
         f"# Транскрипция: {job['filename']}",
         "",
         f"- Создано: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
-        f"- Движок: faster-whisper `{MODEL_NAME}`",
+        f"- {imported_note}",
         f"- Язык: {job.get('detected_language') or job['language']}",
         f"- Длительность: {format_timestamp(float(job.get('duration') or 0))}",
         "",
@@ -452,9 +628,11 @@ def write_results(job: dict[str, Any], segments: list[dict[str, Any]], text: str
         "",
     ]
     for segment in segments:
-        lines.append(
-            f"**[{format_timestamp(segment['start'])} → {format_timestamp(segment['end'])}]**  \n{segment['text']}"
-        )
+        if segment.get("start") is None or segment.get("end") is None:
+            stamp_line = "**[без таймкода]**"
+        else:
+            stamp_line = f"**[{format_timestamp(float(segment['start']))} → {format_timestamp(float(segment['end']))}]**"
+        lines.append(f"{stamp_line}  \n{segment['text']}")
         lines.append("")
     md_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8-sig")
     json_path = RESULT_DIR / f"{base}.json"
@@ -585,7 +763,14 @@ def build_cutter_inputs(job: dict[str, Any]) -> tuple[list[dict[str, Any]], dict
     stream_index = pipeline.get("stream_index") or {}
     index_episodes = normalize_list(stream_index, ("episodes",))
     episode_by_id = {str(item.get("episode_id")).strip(): item for item in index_episodes if item.get("episode_id") is not None}
-    transcript = job.get("segments") or []
+    transcript = []
+    for segment in job.get("segments") or []:
+        try:
+            float(segment["start"])
+            float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        transcript.append(segment)
     errors: list[str] = []
     inputs: list[dict[str, Any]] = []
     output_dir = RESULT_DIR / job["id"]
@@ -748,6 +933,8 @@ def finalize_pipeline_outputs(job_id: str) -> None:
         editor_ideas_count=len(pipeline.get("editor_ideas") or []),
         editor_status=(f"EDITOR: {len(pipeline['editor_ideas'])} video ideas loaded" if pipeline.get("editor_ideas") else ""),
     )
+    with jobs_lock:
+        persist_project_state(dict(jobs[job_id]))
 
 
 def transcribe_job(job_id: str) -> None:
@@ -927,6 +1114,8 @@ def transcribe_job(job_id: str) -> None:
             pipeline_files=pipeline_files,
             pipeline_status="manual_ready" if snapshot.get("ai_mode", "manual") == "manual" else "queued",
         )
+        with jobs_lock:
+            persist_project_state(dict(jobs[job_id]))
         if snapshot.get("ai_mode", "manual") == "api":
             run_ai_pipeline(job_id, chunks)
     except InterruptedError as exc:
@@ -962,6 +1151,180 @@ def health() -> dict[str, Any]:
         "model": MODEL_NAME,
         "model_loaded": whisper_model is not None,
     }
+
+
+def transcript_preview(payload: dict[str, Any], filename: str) -> dict[str, Any]:
+    duration = float(payload.get("duration") or 0)
+    chunks = chunk_transcript(payload.get("segments") or [], duration)
+    warning = "" if payload.get("timestamped") else (
+        "В файле нет временной привязки. Его можно использовать для смыслового анализа, "
+        "но нельзя надёжно использовать для CUTTER и DaVinci."
+    )
+    return {
+        "filename": filename,
+        "source_format": payload.get("source_format"),
+        "duration": duration,
+        "duration_time": format_hhmmss(duration) if duration else "",
+        "segments": len(payload.get("segments") or []),
+        "timestamped": bool(payload.get("timestamped")),
+        "first_timestamp": payload.get("first_timestamp"),
+        "last_timestamp": payload.get("last_timestamp"),
+        "chunks_total": len(chunks),
+        "warning": warning,
+    }
+
+
+@app.post("/api/transcripts/preview")
+def preview_transcript(file: UploadFile = File(...)) -> dict[str, Any]:
+    filename = Path(file.filename or "transcript.txt").name
+    if Path(filename).suffix.lower() not in TRANSCRIPT_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Поддерживаются JSON, Markdown и TXT")
+    try:
+        payload = parse_transcript_payload(filename, file.file.read())
+        return transcript_preview(payload, filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        file.file.close()
+
+
+@app.post("/api/transcripts/import")
+def import_transcript(
+    file: UploadFile = File(...),
+    ai_mode: str = Form("manual"),
+    ai_model: str = Form("gpt-5-mini"),
+) -> dict[str, Any]:
+    filename = Path(file.filename or "transcript.txt").name
+    if Path(filename).suffix.lower() not in TRANSCRIPT_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Поддерживаются JSON, Markdown и TXT")
+    if ai_mode not in {"manual", "api"}:
+        raise HTTPException(status_code=400, detail="Неизвестный AI mode")
+    try:
+        parsed = parse_transcript_payload(filename, file.file.read())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        file.file.close()
+
+    job_id = uuid.uuid4().hex[:12]
+    now = time.time()
+    duration = float(parsed.get("duration") or 0)
+    segments = parsed.get("segments") or []
+    chunks = chunk_transcript(segments, duration)
+    job: dict[str, Any] = {
+        "id": job_id,
+        "filename": filename,
+        "source_path": "",
+        "size": 0,
+        "status": "complete",
+        "stage": "complete",
+        "message": "Транскрипция импортирована",
+        "progress": 100.0,
+        "duration": duration,
+        "duration_time": format_hhmmss(duration) if duration else "",
+        "fps": None,
+        "fps_label": "Не применимо",
+        "fps_source": "imported transcript",
+        "drop_frame": None,
+        "fps_override": "",
+        "chunk_seconds": CHUNK_SECONDS,
+        "overlap_seconds": OVERLAP_SECONDS,
+        "chunks": chunks,
+        "chunk_manifest": [
+            {
+                "chunk_number": chunk["chunk_number"],
+                "chunk_start": chunk["chunk_start"],
+                "chunk_end": chunk["chunk_end"],
+                "chunk_start_time": chunk["chunk_start_time"],
+                "chunk_end_time": chunk["chunk_end_time"],
+                "status": "ready",
+            }
+            for chunk in chunks
+        ],
+        "chunks_total": len(chunks),
+        "chunks_ready": len(chunks),
+        "chunk_files": {},
+        "ai_mode": ai_mode,
+        "ai_model": ai_model,
+        "pipeline_status": "manual_ready" if ai_mode == "manual" or not chunks else "queued",
+        "pipeline_error": "",
+        "editor_status": "",
+        "editor_ideas_count": 0,
+        "editor_ideas": [],
+        "cutter_inputs": [],
+        "cutter_input_files": {},
+        "pipeline": {},
+        "pipeline_files": {},
+        "edl_files": {},
+        "csv_files": {},
+        "processed_seconds": duration,
+        "elapsed_seconds": 0.0,
+        "eta_seconds": 0,
+        "language": "imported",
+        "detected_language": "",
+        "segments": segments,
+        "transcript": parsed.get("text") or "",
+        "error": "",
+        "imported": True,
+        "source_format": parsed.get("source_format"),
+        "timestamped": bool(parsed.get("timestamped")),
+        "timestamp_warning": "" if parsed.get("timestamped") else (
+            "В файле нет временной привязки. Его можно использовать для смыслового анализа, "
+            "но нельзя надёжно использовать для CUTTER и DaVinci."
+        ),
+        "first_timestamp": parsed.get("first_timestamp"),
+        "last_timestamp": parsed.get("last_timestamp"),
+        "cancel_requested": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    with jobs_lock:
+        jobs[job_id] = job
+    txt_path, md_path, json_path, pipeline_files = write_results(job, segments, str(parsed.get("text") or ""))
+    job.update(
+        txt_path=str(txt_path),
+        md_path=str(md_path),
+        json_path=str(json_path),
+        pipeline_files=pipeline_files,
+        chunk_files={key: value for key, value in pipeline_files.items() if key.startswith("chunk_")},
+    )
+    finalize_pipeline_outputs(job_id)
+    with jobs_lock:
+        persist_project_state(dict(jobs[job_id]))
+        response = public_job(dict(jobs[job_id]))
+    if ai_mode == "api" and chunks:
+        worker.submit(run_ai_pipeline, job_id, chunks)
+    return response
+
+
+@app.get("/api/projects")
+def list_projects() -> list[dict[str, Any]]:
+    with jobs_lock:
+        snapshots = list(jobs.values())
+    snapshots.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+    return [
+        {
+            "id": item.get("id"),
+            "filename": item.get("filename"),
+            "updated_at": item.get("updated_at"),
+            "duration": item.get("duration"),
+            "duration_time": item.get("duration_time"),
+            "source_format": item.get("source_format") or Path(str(item.get("filename") or "")).suffix.upper().lstrip("."),
+            "timestamped": item.get("timestamped", True),
+            "status": item.get("status"),
+        }
+        for item in snapshots
+        if item.get("status") == "complete"
+    ]
+
+
+@app.get("/api/projects/{project_id}/open")
+def open_project(project_id: str) -> dict[str, Any]:
+    with jobs_lock:
+        job = jobs.get(project_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Проект не найден")
+        return public_job(dict(job))
 
 
 @app.post("/api/jobs")
@@ -1173,3 +1536,6 @@ def save_pipeline_result(job_id: str, stage: str, payload: Any = Body(...)) -> d
     finalize_pipeline_outputs(job_id)
     with jobs_lock:
         return public_job(dict(jobs[job_id]))
+
+
+restore_projects()

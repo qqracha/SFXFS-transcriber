@@ -18,9 +18,30 @@ import { Progress, ProgressLabel, ProgressValue } from '@/components/ui/progress
 
 const API = 'http://127.0.0.1:8765';
 const ACCEPTED = ['mp4', 'mp3', 'wav'];
+const TRANSCRIPT_ACCEPTED = ['json', 'md', 'txt'];
 
-type Segment = { id: number; start: number; end: number; text: string };
+type Segment = { id: number; start: number | null; end: number | null; text: string; [key: string]: unknown };
 type VideoIdea = Record<string, unknown>;
+type TranscriptPreview = {
+  filename: string;
+  source_format: string;
+  duration: number;
+  duration_time: string;
+  segments: number;
+  timestamped: boolean;
+  first_timestamp: number | null;
+  last_timestamp: number | null;
+  chunks_total: number;
+  warning: string;
+};
+type ProjectSummary = {
+  id: string;
+  filename: string;
+  updated_at: number;
+  duration_time: string;
+  source_format: string;
+  timestamped: boolean;
+};
 type Job = {
   id: string;
   filename: string;
@@ -56,6 +77,12 @@ type Job = {
   editor_ideas_count: number;
   editor_ideas: VideoIdea[];
   cutter_input_files: Record<string, string>;
+  imported?: boolean;
+  source_format?: string;
+  timestamped?: boolean;
+  timestamp_warning?: string;
+  first_timestamp?: number | null;
+  last_timestamp?: number | null;
 };
 
 function bytes(value: number) {
@@ -74,7 +101,8 @@ function clock(value?: number | null) {
     : `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
-function stamp(value: number) {
+function stamp(value: number | null) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
   const hours = Math.floor(value / 3600);
   const minutes = Math.floor((value % 3600) / 60);
   const seconds = Math.floor(value % 60);
@@ -111,7 +139,13 @@ function stageName(job: Job | null, uploading: boolean) {
 
 export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const transcriptInputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
+  const [mode, setMode] = useState<'media' | 'transcript'>('media');
+  const [transcriptFile, setTranscriptFile] = useState<File | null>(null);
+  const [transcriptPreview, setTranscriptPreview] = useState<TranscriptPreview | null>(null);
+  const [transcriptUploading, setTranscriptUploading] = useState(false);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [language, setLanguage] = useState('ru');
   const [aiMode, setAiMode] = useState<'manual' | 'api'>('manual');
   const [aiModel, setAiModel] = useState('gpt-5-mini');
@@ -139,6 +173,13 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    fetch(`${API}/api/projects`)
+      .then((response) => response.ok ? response.json() : [])
+      .then((items) => setProjects(items as ProjectSummary[]))
+      .catch(() => setProjects([]));
+  }, [job?.id]);
+
+  useEffect(() => {
     const currentJobId = job?.id;
     const currentStatus = job?.status;
     const currentPipelineStatus = job?.pipeline_status;
@@ -164,8 +205,73 @@ export default function Home() {
     }
     setError('');
     setJob(null);
+    setMode('media');
+    setTranscriptFile(null);
+    setTranscriptPreview(null);
     setFile(candidate);
   }, []);
+
+  const selectTranscript = useCallback(async (candidate?: File) => {
+    if (!candidate) return;
+    const extension = candidate.name.split('.').pop()?.toLowerCase() || '';
+    if (!TRANSCRIPT_ACCEPTED.includes(extension)) {
+      setError('Нужен JSON, Markdown или TXT файл.');
+      return;
+    }
+    setError('');
+    setFile(null);
+    setJob(null);
+    setMode('transcript');
+    setTranscriptFile(candidate);
+    setTranscriptPreview(null);
+    const form = new FormData();
+    form.append('file', candidate);
+    try {
+      const response = await fetch(`${API}/api/transcripts/preview`, { method: 'POST', body: form });
+      const payload = await response.json().catch(() => ({})) as { detail?: string } & Partial<TranscriptPreview>;
+      if (!response.ok) throw new Error(payload.detail || 'Не удалось прочитать транскрипцию.');
+      setTranscriptPreview(payload as TranscriptPreview);
+    } catch (previewError) {
+      setTranscriptFile(null);
+      setError(previewError instanceof Error ? previewError.message : 'Не удалось прочитать транскрипцию.');
+    }
+  }, []);
+
+  const importTranscript = async () => {
+    if (!transcriptFile || transcriptUploading) return;
+    setTranscriptUploading(true);
+    setError('');
+    const form = new FormData();
+    form.append('file', transcriptFile);
+    form.append('ai_mode', aiMode);
+    form.append('ai_model', aiModel);
+    try {
+      const response = await fetch(`${API}/api/transcripts/import`, { method: 'POST', body: form });
+      const payload = await response.json().catch(() => ({})) as { detail?: string };
+      if (!response.ok) throw new Error(payload.detail || 'Не удалось импортировать транскрипцию.');
+      setJob(payload as Job);
+    } catch (importError) {
+      setError(importError instanceof Error ? importError.message : 'Не удалось импортировать транскрипцию.');
+    } finally {
+      setTranscriptUploading(false);
+    }
+  };
+
+  const openProject = async (projectId: string) => {
+    try {
+      const response = await fetch(`${API}/api/projects/${projectId}/open`);
+      if (!response.ok) throw new Error('Проект не найден.');
+      const restored = await response.json() as Job;
+      setFile(null);
+      setTranscriptFile(null);
+      setTranscriptPreview(null);
+      setMode('transcript');
+      setJob(restored);
+      setError('');
+    } catch (openError) {
+      setError(openError instanceof Error ? openError.message : 'Не удалось открыть проект.');
+    }
+  };
 
   const start = () => {
     if (!file || uploading) return;
@@ -207,6 +313,9 @@ export default function Home() {
   const reset = () => {
     setFile(null);
     setJob(null);
+    setTranscriptFile(null);
+    setTranscriptPreview(null);
+    setMode('media');
     setError('');
     setCopied(false);
     setUploadProgress(0);
@@ -286,19 +395,23 @@ export default function Home() {
         </div>
       </header>
 
-      {!file ? (
+      {!file && !job ? (
         <section className="intro-view">
+          <div className="mode-tabs" role="tablist" aria-label="Режим работы">
+            <button className={mode === 'media' ? 'is-active' : ''} onClick={() => { setMode('media'); setError(''); }}>Обработать медиа</button>
+            <button className={mode === 'transcript' ? 'is-active' : ''} onClick={() => { setMode('transcript'); setError(''); }}>Импорт транскрипции</button>
+          </div>
           <p className="eyebrow">New transcript</p>
           <h1>
-            Запись —<br />
-            <em>в текст, который</em><br />
-            легко читать<span className="accent-dot">.</span>
+            {mode === 'media' ? <>Запись —<br /><em>в текст, который</em><br />легко читать<span className="accent-dot">.</span></> : <>Готовый текст —<br /><em>снова в рабочий</em><br />проект<span className="accent-dot">.</span></>}
           </h1>
           <p className="intro-copy">
-            MP4, MP3 или WAV обрабатываются на этом компьютере. Видно каждый этап: загрузку, текущую позицию в записи и оставшееся время.
+            {mode === 'media'
+              ? 'MP4, MP3 или WAV обрабатываются на этом компьютере. Видно каждый этап: загрузку, текущую позицию в записи и оставшееся время.'
+              : 'Импортируйте JSON, Markdown или TXT с готовой транскрипцией. Таймкоды сохранятся, а проект продолжит общий LOGGER → EDITOR → CUTTER pipeline без повторного распознавания.'}
           </p>
 
-          <div
+          {mode === 'media' ? <div
             className={`drop-zone ${dragging ? 'is-dragging' : ''}`}
             role="button"
             tabIndex={0}
@@ -326,24 +439,55 @@ export default function Home() {
               <p>или выберите его через Проводник</p>
             </div>
             <span className="drop-action">Выбрать файл <ArrowRight /></span>
-          </div>
+          </div> : <div
+            className={`drop-zone ${dragging ? 'is-dragging' : ''}`}
+            role="button"
+            tabIndex={0}
+            onClick={() => transcriptInputRef.current?.click()}
+            onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') transcriptInputRef.current?.click(); }}
+            onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
+            onDragOver={(event) => event.preventDefault()}
+            onDragLeave={() => setDragging(false)}
+            onDrop={(event) => { event.preventDefault(); setDragging(false); void selectTranscript(event.dataTransfer.files[0]); }}
+          >
+            <input ref={transcriptInputRef} type="file" className="sr-only" accept=".json,.md,.txt,application/json,text/markdown,text/plain" onChange={(event) => void selectTranscript(event.target.files?.[0])} />
+            <div>
+              <p className="eyebrow">Import / 01</p>
+              <strong>{transcriptFile ? transcriptFile.name : 'Перетащите готовую транскрипцию'}</strong>
+              <p>JSON предпочтителен; также поддерживаются Markdown и TXT с таймкодами.</p>
+            </div>
+            <span className="drop-action">Выбрать файл <ArrowRight /></span>
+          </div>}
+          {mode === 'transcript' && transcriptPreview && (
+            <div className="transcript-preview-panel">
+              <div><span>Формат</span><strong>{transcriptPreview.source_format}</strong></div>
+              <div><span>Реплики</span><strong>{transcriptPreview.segments}</strong></div>
+              <div><span>Таймкоды</span><strong>{transcriptPreview.timestamped ? 'найдены' : 'нет'}</strong></div>
+              <div><span>LOGGER</span><strong>{transcriptPreview.chunks_total} чанка</strong></div>
+              {transcriptPreview.warning && <p className="warning-line">{transcriptPreview.warning}</p>}
+              <Button className="start-button" onClick={importTranscript} disabled={transcriptUploading}>
+                {transcriptUploading ? 'Импортирую…' : 'Импортировать в проект'} <ArrowRight data-icon="inline-end" />
+              </Button>
+            </div>
+          )}
           {error && <p className="error-line">{error}</p>}
           <div className="intro-footnote">
-            <span>01&nbsp;&nbsp; тот же faster-whisper</span>
-            <span>02&nbsp;&nbsp; модель small</span>
+            <span>01&nbsp;&nbsp; {mode === 'media' ? 'тот же faster-whisper' : 'без повторного распознавания'}</span>
+            <span>02&nbsp;&nbsp; {mode === 'media' ? 'модель small' : 'JSON / MD / TXT'}</span>
             <span>03&nbsp;&nbsp; Manual / OpenAI API</span>
           </div>
+          {!!projects.length && <div className="recent-projects"><p className="eyebrow">Recent projects</p>{projects.slice(0, 6).map((project) => <button key={project.id} onClick={() => void openProject(project.id)}><span>{project.filename}</span><small>{project.source_format} · {project.duration_time || 'без длительности'} · {project.timestamped ? 'таймкоды' : 'без таймкодов'}</small><ArrowRight /></button>)}</div>}
         </section>
       ) : (
         <section className="workspace-view">
           <div className="file-head">
             <div className="file-title">
-              <p className="eyebrow">Current file</p>
-              <h1>{file.name}<span className="accent-dot">.</span></h1>
-              <p>{bytes(file.size)} · {file.type || 'медиафайл'}</p>
+              <p className="eyebrow">{job?.imported ? 'Imported transcript' : 'Current file'}</p>
+              <h1>{file?.name || job?.filename}<span className="accent-dot">.</span></h1>
+              <p>{file ? `${bytes(file.size)} · ${file.type || 'медиафайл'}` : `${job?.source_format || 'JSON'} · ${job?.timestamped ? 'таймкоды сохранены' : 'без таймкодов'}`}</p>
             </div>
             <div className="file-actions">
-              <label htmlFor="language-select">
+              {!job?.imported && <label htmlFor="language-select">
                 <span>Язык</span>
                 <NativeSelect
                   value={language}
@@ -356,23 +500,23 @@ export default function Home() {
                   <NativeSelectOption value="auto">Определить автоматически</NativeSelectOption>
                   <NativeSelectOption value="en">English</NativeSelectOption>
                 </NativeSelect>
-              </label>
-              <label htmlFor="ai-mode-select">
+              </label>}
+              {!job?.imported && <label htmlFor="ai-mode-select">
                 <span>AI mode</span>
                 <NativeSelect id="ai-mode-select" value={aiMode} disabled={active} onChange={(event) => setAiMode(event.target.value as 'manual' | 'api')} className="language-select">
                   <NativeSelectOption value="manual">Manual / JSON</NativeSelectOption>
                   <NativeSelectOption value="api">OpenAI API</NativeSelectOption>
                 </NativeSelect>
-              </label>
-              {aiMode === 'api' && <label><span>Модель</span><input className="model-input" value={aiModel} disabled={active} onChange={(event) => setAiModel(event.target.value)} /></label>}
-              <label><span>FPS</span><input className="model-input" value={fpsOverride} disabled={active} placeholder="Auto (из файла)" onChange={(event) => setFpsOverride(event.target.value)} /></label>
+              </label>}
+              {!job?.imported && aiMode === 'api' && <label><span>Модель</span><input className="model-input" value={aiModel} disabled={active} onChange={(event) => setAiModel(event.target.value)} /></label>}
+              {!job?.imported && <label><span>FPS</span><input className="model-input" value={fpsOverride} disabled={active} placeholder="Auto (из файла)" onChange={(event) => setFpsOverride(event.target.value)} /></label>}
               {!active && (
                 <button className="text-button" onClick={reset}>Выбрать другой</button>
               )}
             </div>
           </div>
 
-          {!active && (
+          {!active && file && (
             <div className="ready-panel">
               <div className="media-preview">
                 {file.name.toLowerCase().endsWith('.mp4') ? (
@@ -473,6 +617,7 @@ export default function Home() {
                     <div><span>LOGGER</span><strong>25 мин / overlap 5 мин</strong></div>
                     <div><span>AI mode</span><strong>{job.ai_mode === 'api' ? 'OpenAI API' : 'Manual JSON'}</strong></div>
                   </div>
+                  {job.timestamp_warning && <p className="warning-line result-warning">{job.timestamp_warning}</p>}
                   <div className="export-panel">
                     <div><p className="eyebrow">Resolve exports</p><strong>Маркеры для DaVinci</strong><p>Основной экспорт — CUTTER EDL. Остальные уровни доступны отдельно для проверки.</p></div>
                     <div className="export-links">
